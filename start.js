@@ -28,6 +28,10 @@ const CHROME_PATH =
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 const DEFAULT_DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 50);
+const HEADLESS =
+  process.env.HEADLESS
+    ? String(process.env.HEADLESS).toLowerCase() !== "false"
+    : true; // ברירת מחדל: בלי חלון דפדפן
 
 // כמה זמן הודעה יכולה להיות "sending" לפני ששרת אחר יכול להשתלט
 const LOCK_LEASE_MS = 2 * 60 * 1000; // 2 דקות
@@ -137,11 +141,15 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
   const db = admin.database();
 
   // ✅ SERVER_ID: אם יש ENV – נשתמש בו, אחרת אוטומטי (server1/server2/…)
-  let SERVER_ID = process.env.SERVER_ID;
-  if (!SERVER_ID) {
-    SERVER_ID = await getOrCreateServerId(db);
-  }
-  SERVER_ID = String(SERVER_ID).trim().toLowerCase();
+let SERVER_ID = process.env.SERVER_ID;
+
+if (!SERVER_ID) {
+  console.error("❌ Missing SERVER_ID. Run like: SERVER_ID=server1 node start.js");
+  process.exit(1);
+}
+
+SERVER_ID = String(SERVER_ID).trim().toLowerCase();
+
 
   // log אחרי שיש לנו SERVER_ID
   function log(msg) {
@@ -158,12 +166,107 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
 
   // HEALTH_PORT לפי המספר שבשרת (או override מה-ENV)
   const n = Number(String(SERVER_ID).replace("server", "")) || 1;
-  const HEALTH_PORT = Number(process.env.HEALTH_PORT || 0) || 3100 + n;
+function stablePortFromId(id, base = 3100, range = 2000) {
+  let h = 0;
+  const s = String(id || "");
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return base + (Math.abs(h) % range);
+}
+
+// במקום החישוב הישן:
+const HEALTH_PORT =
+  Number(process.env.HEALTH_PORT || 0) || stablePortFromId(SERVER_ID);
 
   // refs
   const whatsappRef = db.ref("whatsapp");
   const serverRef = db.ref(`servers/${SERVER_ID}`);
   const processLockRef = db.ref(`servers/${SERVER_ID}/processLock`);
+const cmdRef = db.ref(`serverCommands/${SERVER_ID}`);
+let cmdBusy = false;
+
+function rmSessionDir() {
+  const sessionDir = path.join(__dirname, ".wwebjs_auth", `session-${SERVER_ID}`);
+  try {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+    log(`🧹 removed session dir: ${sessionDir}`);
+  } catch (e) {
+    log(`⚠️ session dir cleanup skipped: ${e.message}`);
+  }
+}
+
+async function restartClient(reason = "restart") {
+  log(`♻️ restartClient: ${reason}`);
+
+  try { if (client) await client.destroy(); } catch {}
+  client = null;
+
+  cleanupChromeSingletonLocks(SERVER_ID, log);
+
+  waState = "booting";
+  waReady = false;
+  await updateServer({ status: "booting", state: "restarting" }, { touchUpdatedAt: true }).catch(() => {});
+
+  setupWhatsAppClient();
+  client.initialize();
+}
+
+async function handleCommand(cmd) {
+  const action = String(cmd?.action || "").toLowerCase();
+  if (!action) return;
+
+  // כדי לא להריץ פעמיים אם יש ספייקים
+  if (cmdBusy) return;
+  cmdBusy = true;
+
+  try {
+    if (action === "delete") {
+      log("🗑️ command: delete (logout + cleanup + remove)");
+
+      await updateServer({ status: "deleting", state: "logout_and_cleanup" }, { touchUpdatedAt: true }).catch(() => {});
+
+      try { if (client) await client.logout(); } catch {}
+      try { if (client) await client.destroy(); } catch {}
+
+      rmSessionDir();
+
+      // מוחק מה-DB (רק בסוף!)
+      await serverRef.remove().catch(() => {});
+      await cmdRef.remove().catch(() => {});
+
+      log("✅ deleted. exiting process");
+      process.exit(0);
+    }
+
+    if (action === "ensure_running" || action === "start") {
+      log(`🧠 command: ${action}`);
+
+      // אם כבר מחובר ורץ – רק ננקה פקודה
+      if (client && waReady) {
+        await cmdRef.remove().catch(() => {});
+        return;
+      }
+
+      // אם יש תהליך אבל הדפדפן/סשן קרס → restart
+      await restartClient(action);
+      await cmdRef.remove().catch(() => {});
+      return;
+    }
+
+    // default: נקה פקודות לא מוכרות
+    await cmdRef.remove().catch(() => {});
+  } finally {
+    cmdBusy = false;
+  }
+}
+
+// מאזינים לפקודות (אחרי שיש ProcessLock)
+function startCommandListener() {
+  cmdRef.on("value", async (snap) => {
+    if (!snap.exists()) return;
+    const cmd = snap.val();
+    await handleCommand(cmd);
+  });
+}
 
   // ================== PROCESS LOCK ==================
   let procHeartbeatTimer = null;
@@ -255,6 +358,7 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
   // ================== SERVER CONFIG WATCHERS ==================
   let serverEnabled = true;
   let dailyLimit = DEFAULT_DAILY_LIMIT;
+let sendDelayMs = 3000; // ברירת מחדל 3 שניות
 
   async function initServerConfigWatchers() {
     const snap = await serverRef.once("value");
@@ -281,6 +385,11 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
       log(`🔢 dailyLimit updated => ${dailyLimit}`);
     });
   }
+serverRef.child("sendDelayMs").on("value", (s) => {
+  const n = Number(s.val());
+  sendDelayMs = Number.isFinite(n) && n >= 0 ? n : 3000;
+  log(`⏱️ sendDelayMs updated => ${sendDelayMs}`);
+});
 
   // ================== DAILY COUNT ==================
   let today = dayKey(new Date());
@@ -438,14 +547,19 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
   function setupWhatsAppClient() {
     log("🔧 מאתחל WhatsApp client...");
 
-    client = new Client({
-      authStrategy: new LocalAuth({ clientId: SERVER_ID }),
-      puppeteer: {
-        executablePath: CHROME_PATH,
-        headless: false,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      },
-    });
+client = new Client({
+  authStrategy: new LocalAuth({ clientId: SERVER_ID }),
+  puppeteer: {
+    executablePath: CHROME_PATH,
+    headless: HEADLESS, // ✅ נשלט ע"י ENV
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
+  },
+});
+
 
     client.on("qr", (qr) => {
       qrcode.generate(qr, { small: true });
@@ -611,7 +725,7 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
           }
 
           try {
-            await new Promise((r) => setTimeout(r, 900));
+await new Promise((r) => setTimeout(r, Math.max(900, sendDelayMs)));
 
             const phone = sanitizePhone(msgObj.formattedContacts);
             const jid = `${phone}@c.us`;
@@ -786,6 +900,7 @@ function cleanupChromeSingletonLocks(SERVER_ID, log) {
   // 1) lock
   await acquireProcessLockOrExit();
   installEarlyShutdownHandlers();
+startCommandListener();
 
   // 2) register server base (פעם אחת)
   await serverRef.update({
