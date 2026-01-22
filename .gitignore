@@ -1,0 +1,20 @@
+cat >> .gitignore << 'EOF'
+# WhatsApp-web.js auth/session (Chromium profile) - NEVER commit
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Chromium / Puppeteer leftovers
+**/Default/
+**/Cache/
+**/Code Cache/
+**/GPUCache/
+**/Service Worker/
+
+# Node
+node_modules/
+.env
+EOF
+firebase-config.json
+final-project-d6ce7-firebase-adminsdk-*.json
+*adminsdk*.json
+*service*account*.json

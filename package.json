@@ -1,0 +1,19 @@
+{
+  "name": "bot-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "start.js",
+  "scripts": {
+    "start": "node start.js",
+    "start:all": "node start.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "baileys": "^6.7.17",
+    "firebase-admin": "^13.6.0",
+    "pino": "^10.1.0",
+    "puppeteer": "^24.35.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#main"
+  }
+}

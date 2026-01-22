@@ -1,0 +1,2 @@
+node start.js
+SERVER_ID=server3 node start.js
